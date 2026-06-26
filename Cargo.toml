@@ -1,6 +1,6 @@
 [package]
 name = "animus-log-storage-s3"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "Elastic-2.0"
 description = "S3-compatible log_storage backend for Animus — durable, offloaded agent run logs on any S3 API (Railway, MinIO, R2, AWS S3)"

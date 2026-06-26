@@ -26,6 +26,7 @@ use animus_plugin_protocol::{error_codes, EnvRequirement, RpcError};
 use animus_plugin_runtime::{MethodContext, Plugin};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use tokio::sync::OnceCell;
 
 use animus_log_storage_s3::S3LogBackend;
 
@@ -33,6 +34,34 @@ use animus_log_storage_s3::S3LogBackend;
 struct StoreParams {
     #[serde(default)]
     entries: Vec<LogEntry>,
+}
+
+/// Lazily-initialized S3 backend. The backend reads its config (S3_BUCKET +
+/// credentials) from the environment, but that env is only present at RUNTIME —
+/// NOT during the install-time `--manifest` capability probe. Building the
+/// backend eagerly in `main` made the probe fail ("S3_BUCKET unset"), so the
+/// plugin could not be installed. Initializing on first real op keeps
+/// `--manifest`/`initialize`/`health` working with no S3 env, and surfaces a
+/// genuine misconfiguration only when a store/query is actually attempted.
+struct LazyBackend {
+    cell: OnceCell<S3LogBackend>,
+}
+
+impl LazyBackend {
+    fn new() -> Self {
+        Self { cell: OnceCell::new() }
+    }
+
+    async fn get(&self) -> Result<&S3LogBackend, RpcError> {
+        self.cell
+            .get_or_try_init(|| async { S3LogBackend::from_env().await })
+            .await
+            .map_err(|e| RpcError {
+                code: error_codes::INTERNAL_ERROR,
+                message: format!("S3 log backend init failed: {e}"),
+                data: None,
+            })
+    }
 }
 
 fn env_req(name: &str, description: &str, sensitive: bool, required: bool) -> EnvRequirement {
@@ -59,7 +88,7 @@ async fn main() -> anyhow::Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    let backend = Arc::new(S3LogBackend::from_env().await?);
+    let backend = Arc::new(LazyBackend::new());
 
     let store_backend = backend.clone();
     let query_backend = backend.clone();
@@ -109,13 +138,13 @@ async fn main() -> anyhow::Result<()> {
     .register_method::<StoreParams, Value, _, _>(METHOD_LOG_STORAGE_STORE, move |params, _ctx| {
         let backend = store_backend.clone();
         async move {
-            backend.store(params.entries).await.map_err(rpc_from)?;
+            backend.get().await?.store(params.entries).await.map_err(rpc_from)?;
             Ok(json!({}))
         }
     })
     .register_method::<LogQuery, _, _, _>(METHOD_LOG_STORAGE_QUERY, move |filter, _ctx| {
         let backend = query_backend.clone();
-        async move { backend.query(filter).await.map_err(rpc_from) }
+        async move { backend.get().await?.query(filter).await.map_err(rpc_from) }
     })
     .register_raw_method(
         METHOD_LOG_STORAGE_TAIL,
@@ -129,7 +158,7 @@ async fn main() -> anyhow::Result<()> {
                 })?;
                 // Snapshot the matching window, then stream it as
                 // `log_storage/event` notifications carrying the request id.
-                let result = backend.query(filter).await.map_err(rpc_from)?;
+                let result = backend.get().await?.query(filter).await.map_err(rpc_from)?;
                 let request_id = ctx.request_id.clone();
                 let notifier = ctx.notifier.clone();
                 tokio::spawn(async move {
@@ -155,11 +184,11 @@ async fn main() -> anyhow::Result<()> {
     )
     .register_method::<Value, _, _, _>(METHOD_LOG_STORAGE_SCHEMA, move |_params: Value, _ctx| {
         let backend = schema_backend.clone();
-        async move { Ok(backend.schema()) }
+        async move { Ok(backend.get().await?.schema()) }
     })
     .on_health(move || {
         let backend = health_backend.clone();
-        async move { backend.health().await.map_err(rpc_from) }
+        async move { backend.get().await?.health().await.map_err(rpc_from) }
     });
 
     plugin.run().await
