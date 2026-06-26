@@ -1,0 +1,42 @@
+[package]
+name = "animus-log-storage-s3"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+description = "S3-compatible log_storage backend for Animus — durable, offloaded agent run logs on any S3 API (Railway, MinIO, R2, AWS S3)"
+repository = "https://github.com/launchapp-dev/animus-log-storage-s3"
+homepage = "https://github.com/launchapp-dev/animus-cli"
+readme = "README.md"
+default-run = "animus-log-storage-s3"
+
+[lib]
+name = "animus_log_storage_s3"
+path = "src/lib.rs"
+
+[[bin]]
+name = "animus-log-storage-s3"
+path = "src/main.rs"
+
+[dependencies]
+animus-plugin-protocol      = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.21" }
+animus-log-storage-protocol = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.21" }
+animus-plugin-runtime       = { git = "https://github.com/launchapp-dev/animus-protocol", tag = "v0.1.21" }
+
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-credential-types = "1"
+aws-smithy-types = "1"
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "io-std"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+async-trait = "0.1"
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-core = "0.3"
+futures-util = "0.3"
+
+[dev-dependencies]
