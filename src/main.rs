@@ -49,7 +49,9 @@ struct LazyBackend {
 
 impl LazyBackend {
     fn new() -> Self {
-        Self { cell: OnceCell::new() }
+        Self {
+            cell: OnceCell::new(),
+        }
     }
 
     async fn get(&self) -> Result<&S3LogBackend, RpcError> {
@@ -138,7 +140,12 @@ async fn main() -> anyhow::Result<()> {
     .register_method::<StoreParams, Value, _, _>(METHOD_LOG_STORAGE_STORE, move |params, _ctx| {
         let backend = store_backend.clone();
         async move {
-            backend.get().await?.store(params.entries).await.map_err(rpc_from)?;
+            backend
+                .get()
+                .await?
+                .store(params.entries)
+                .await
+                .map_err(rpc_from)?;
             Ok(json!({}))
         }
     })

@@ -17,7 +17,7 @@ use animus_log_storage_protocol::{
 };
 use animus_plugin_protocol::{HealthCheckResult, HealthStatus};
 use async_trait::async_trait;
-use futures_util::stream;
+use futures_util::{stream, StreamExt};
 
 use crate::client::S3Client;
 use crate::config::S3Config;
@@ -26,6 +26,20 @@ use crate::config::S3Config;
 /// not set [`LogQuery::limit`]. Keeps `daemon/logs` bounded to one round-trip
 /// and avoids pulling an unbounded object set across the wire.
 pub const DEFAULT_QUERY_LIMIT: usize = 500;
+
+/// Maximum number of object bodies fetched concurrently while resolving a
+/// query. Object storage GETs are latency-bound, so fanning out turns a long
+/// sequential chain into a handful of round-trips; the cap bounds memory and
+/// the number of in-flight connections.
+const FETCH_CONCURRENCY: usize = 32;
+
+/// Fetch and decode a single stored entry, returning `None` when the object is
+/// missing (listed-then-deleted) or its body is not a valid [`LogEntry`] — a
+/// single bad object must never fail the whole query.
+async fn fetch_entry(client: &S3Client, key: &str) -> Option<LogEntry> {
+    let bytes = client.get_object(key).await.ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
 
 /// The S3 log-storage backend.
 pub struct S3LogBackend {
@@ -73,43 +87,56 @@ impl animus_log_storage_protocol::LogStorageBackend for S3LogBackend {
             }
         }
 
-        let list_prefix = keys::list_prefix(&self.prefix, &filter);
-        let mut all_keys = self
-            .client
-            .list_keys(&list_prefix)
-            .await
-            .map_err(|e| BackendError::Unavailable(e.to_string()))?;
-
-        // Cheap pre-filter on the embedded timestamp before fetching bodies.
-        all_keys.retain(|k| keys::key_in_time_window(k, filter.since, filter.until));
-
-        // Newest keys carry the largest embedded millis; sort descending so we
-        // fetch the most-recent window first and stop at the limit.
-        all_keys.sort_by(|a, b| b.cmp(a));
-
         let limit = filter.limit.unwrap_or(DEFAULT_QUERY_LIMIT);
-
         let mut entries: Vec<LogEntry> = Vec::new();
-        for key in all_keys {
-            if entries.len() >= limit {
-                break;
-            }
-            let bytes = match self.client.get_object(&key).await {
-                Ok(b) => b,
-                // A key listed-then-deleted (or otherwise unreadable) should
-                // not fail the whole query — skip it.
-                Err(_) => continue,
-            };
-            let entry: LogEntry = match serde_json::from_slice(&bytes) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if keys::matches(&entry, &filter) {
-                entries.push(entry);
+        if limit == 0 {
+            return Ok(LogQueryResult {
+                entries,
+                next_cursor: None,
+            });
+        }
+
+        // Scan the smallest set of prefixes that can hold matches, newest
+        // window first. When source + source_name are pinned and a `since`
+        // floor is present this addresses concrete day prefixes directly
+        // instead of listing the whole source history (see `keys::scan_prefixes`).
+        let client = &self.client;
+        'scan: for list_prefix in keys::scan_prefixes(&self.prefix, &filter) {
+            let mut keys = client
+                .list_keys(&list_prefix)
+                .await
+                .map_err(|e| BackendError::Unavailable(e.to_string()))?;
+
+            // Cheap pre-filter on the embedded timestamp before fetching bodies.
+            keys.retain(|k| keys::key_in_time_window(k, filter.since, filter.until));
+
+            // Newest keys carry the largest embedded millis; descending order
+            // means every key in an earlier batch is newer than every key in a
+            // later one, so once we have `limit` matches we can stop — the
+            // remaining keys are strictly older.
+            keys.sort_by(|a, b| b.cmp(a));
+
+            for batch in keys.chunks(FETCH_CONCURRENCY) {
+                // Fan out the body GETs for this batch; filter after decoding
+                // (level/glob/time bounds are not expressible in the key).
+                let mut fetched: Vec<LogEntry> = stream::iter(batch.iter().cloned())
+                    .map(|key| async move { fetch_entry(client, &key).await })
+                    .buffer_unordered(FETCH_CONCURRENCY)
+                    .filter_map(|opt| async move { opt })
+                    .collect()
+                    .await;
+                fetched.retain(|entry| keys::matches(entry, &filter));
+                entries.extend(fetched);
+                if entries.len() >= limit {
+                    break 'scan;
+                }
             }
         }
 
-        // Return chronological (oldest first) per the protocol contract.
+        // Entries were gathered newest-first across prefixes/batches; keep the
+        // newest `limit`, then return chronological (oldest first) per contract.
+        entries.sort_by(|a, b| b.ts.cmp(&a.ts).then_with(|| b.id.cmp(&a.id)));
+        entries.truncate(limit);
         keys::sort_chronological(&mut entries);
         Ok(LogQueryResult {
             entries,
