@@ -41,13 +41,20 @@ The backend declares its capabilities honestly via `log_storage/schema`:
 | `supports_dedup`                 | `true`  | idempotent by derived key |
 | `supports_filtering.by_source`   | `true`  | server-side prefix narrowing |
 | `supports_filtering.by_level`    | `true`  | applied after fetch |
-| `supports_filtering.by_time_range` | `true` | key pre-filter + applied after fetch |
+| `supports_filtering.by_time_range` | `true` | date-prefix scoping + key pre-filter + applied after fetch |
 | `supports_filtering.by_target`   | `true`  | glob applied after fetch |
 | `supports_filtering.by_glob`     | `true`  | full `*` / `**` glob semantics |
 | `max_query_window`               | `None`  | bounded by retention only |
 | `retention_hint`                 | `None`  | retention is an S3 lifecycle policy you set on the bucket |
 
-`source` narrows the list prefix server-side. The remaining filters are
+`source` and `source_name` narrow the list prefix server-side. When both are
+pinned and the query carries a `since` floor, the scan addresses the
+`<YYYY>/<MM>/<DD>` date segments directly — enumerating one concrete day prefix
+per UTC day in the window (newest first, up to a bounded span) instead of
+listing the whole source history. Object bodies are then fetched concurrently,
+newest window first, and the scan stops as soon as `limit` matches are found —
+so a small `limit` never downloads the whole bucket. The remaining filters
+(level floor, exact `source_name`, target glob, precise time bounds) are
 evaluated in-process after fetching object bodies. `since > until` returns a
 domain `INVALID_PARAMS` error. A query with no `limit` returns at most 500
 entries (most-recent first by key, then sorted oldest-first per the protocol).

@@ -30,6 +30,12 @@ use chrono::{DateTime, Datelike, Utc};
 /// chronological order for any timestamp up to the year ~5138.
 const TS_WIDTH: usize = 14;
 
+/// Upper bound on the number of concrete per-day list prefixes we will
+/// enumerate for a bounded time-range query. Beyond this the window is wide
+/// enough that a single broad prefix scan is cheaper than issuing one
+/// `ListObjectsV2` per day, so we fall back to that.
+pub const MAX_DATE_PREFIXES: usize = 92;
+
 fn source_segment(source: LogSource) -> &'static str {
     match source {
         LogSource::Daemon => "daemon",
@@ -83,25 +89,89 @@ pub fn entry_key(prefix: &str, entry: &LogEntry) -> String {
     with_prefix(prefix, &body)
 }
 
-/// The narrowest static list-prefix that still covers every key matching
-/// `filter`. Used to bound the S3 `ListObjectsV2` scan; the remaining filter
-/// predicates are evaluated in-process by [`matches`].
+/// Join one more safe segment onto a partial key prefix.
+fn join_segment(base: &str, segment: &str) -> String {
+    if base.is_empty() {
+        segment.to_string()
+    } else {
+        format!("{base}/{segment}")
+    }
+}
+
+/// The narrowest static key prefix (no trailing slash) that still covers every
+/// key matching `filter`, using only the segments that come *before* the date
+/// portion of the layout: `<prefix>/<source>/<source_name>`.
 ///
-/// Only `source` narrows the prefix today (it is the first key segment).
-/// `since`/`until` could narrow on the date segments but only when both the
-/// source and source_name are pinned; we keep the prefix conservative
-/// (source-only) so a time-range query without a source still works.
-pub fn list_prefix(prefix: &str, filter: &LogQuery) -> String {
-    match filter.source {
-        Some(source) => with_prefix(prefix, &format!("{}/", source_segment(source))),
-        None => {
-            if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix}/")
+/// `source` is the first key segment, so it always narrows when set.
+/// `source_name` is the second segment, so it can only narrow when `source` is
+/// also pinned (you cannot skip a leading segment in an S3 prefix). When
+/// neither is set this is just the bucket prefix (possibly empty).
+fn base_prefix(prefix: &str, filter: &LogQuery) -> String {
+    let mut base = prefix.to_string();
+    if let Some(source) = filter.source {
+        base = join_segment(&base, source_segment(source));
+        if let Some(name) = &filter.source_name {
+            base = join_segment(&base, &sanitize_segment(name));
+        }
+    }
+    base
+}
+
+/// The ordered set of S3 `ListObjectsV2` prefixes to scan for `filter`, sorted
+/// newest window first so the caller can stop once `limit` matches are found.
+///
+/// The key layout `<source>/<source_name>/<YYYY>/<MM>/<DD>/...` makes the date
+/// addressable as a literal prefix, but only once both `source` and
+/// `source_name` are pinned (they precede the date segments). When they are —
+/// and the query carries a `since` floor — we enumerate one concrete day
+/// prefix per UTC day in `[since, until]` (newest first) instead of listing
+/// the entire source history. The upper bound defaults to "now" when `until`
+/// is unset. If the window is unbounded below, or spans more than
+/// [`MAX_DATE_PREFIXES`] days, we fall back to a single narrowed base prefix.
+///
+/// Remaining predicates (level floor, exact source_name, target glob, and the
+/// precise time bounds) are still evaluated in-process by [`matches`].
+pub fn scan_prefixes(prefix: &str, filter: &LogQuery) -> Vec<String> {
+    let base = base_prefix(prefix, filter);
+
+    if filter.source.is_some() && filter.source_name.is_some() {
+        if let Some(since) = filter.since {
+            let upper = filter.until.unwrap_or_else(Utc::now);
+            let lo = since.date_naive();
+            let hi = upper.date_naive();
+            if hi >= lo {
+                let span = (hi - lo).num_days() as usize + 1;
+                if span <= MAX_DATE_PREFIXES {
+                    let mut out = Vec::with_capacity(span);
+                    let mut day = hi;
+                    loop {
+                        out.push(format!(
+                            "{base}/{y:04}/{m:02}/{d:02}/",
+                            y = day.year(),
+                            m = day.month(),
+                            d = day.day(),
+                        ));
+                        if day <= lo {
+                            break;
+                        }
+                        match day.pred_opt() {
+                            Some(prev) => day = prev,
+                            None => break,
+                        }
+                    }
+                    return out;
+                }
             }
         }
     }
+
+    // Fallback: a single prefix narrowed as far as the leading segments allow.
+    let single = if base.is_empty() {
+        String::new()
+    } else {
+        format!("{base}/")
+    };
+    vec![single]
 }
 
 /// Evaluate the in-process predicates of `filter` against a decoded entry.
@@ -308,15 +378,108 @@ mod tests {
     }
 
     #[test]
-    fn list_prefix_narrows_on_source_only() {
+    fn scan_prefixes_falls_back_to_single_narrowed_prefix() {
+        // Source only -> narrow on source segment.
         let q = LogQuery {
             source: Some(LogSource::Cli),
             ..Default::default()
         };
-        assert_eq!(list_prefix("p", &q), "p/cli/");
+        assert_eq!(scan_prefixes("p", &q), vec!["p/cli/"]);
+
+        // No filter -> bucket prefix (or root when empty).
         let q2 = LogQuery::default();
-        assert_eq!(list_prefix("p", &q2), "p/");
-        assert_eq!(list_prefix("", &q2), "");
+        assert_eq!(scan_prefixes("p", &q2), vec!["p/"]);
+        assert_eq!(scan_prefixes("", &q2), vec![String::new()]);
+    }
+
+    #[test]
+    fn scan_prefixes_narrows_on_source_name_when_source_pinned() {
+        // source + source_name (but no `since`) -> narrow to both segments,
+        // still a single prefix (no date enumeration without a floor).
+        let q = LogQuery {
+            source: Some(LogSource::Workflow),
+            source_name: Some("WF-1".into()),
+            until: Some(ts("2026-06-26T00:00:00Z")),
+            ..Default::default()
+        };
+        assert_eq!(scan_prefixes("p", &q), vec!["p/workflow/WF-1/"]);
+
+        // source_name without source cannot narrow the prefix (source is the
+        // leading segment); handled in-process by `matches`.
+        let q2 = LogQuery {
+            source_name: Some("WF-1".into()),
+            ..Default::default()
+        };
+        assert_eq!(scan_prefixes("p", &q2), vec!["p/"]);
+    }
+
+    #[test]
+    fn scan_prefixes_sanitizes_source_name_segment() {
+        let q = LogQuery {
+            source: Some(LogSource::Plugin),
+            source_name: Some("animus-subject/linear".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            scan_prefixes("p", &q),
+            vec!["p/plugin/animus-subject_linear/"]
+        );
+    }
+
+    #[test]
+    fn scan_prefixes_enumerates_days_newest_first() {
+        let q = LogQuery {
+            source: Some(LogSource::Workflow),
+            source_name: Some("WF-1".into()),
+            since: Some(ts("2026-06-24T09:00:00Z")),
+            until: Some(ts("2026-06-26T12:00:00Z")),
+            ..Default::default()
+        };
+        assert_eq!(
+            scan_prefixes("p", &q),
+            vec![
+                "p/workflow/WF-1/2026/06/26/",
+                "p/workflow/WF-1/2026/06/25/",
+                "p/workflow/WF-1/2026/06/24/",
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_prefixes_single_day_window() {
+        let q = LogQuery {
+            source: Some(LogSource::Daemon),
+            source_name: Some("main".into()),
+            since: Some(ts("2026-06-25T00:00:00Z")),
+            until: Some(ts("2026-06-25T23:59:59Z")),
+            ..Default::default()
+        };
+        assert_eq!(scan_prefixes("p", &q), vec!["p/daemon/main/2026/06/25/"]);
+    }
+
+    #[test]
+    fn scan_prefixes_falls_back_when_window_too_wide() {
+        // A multi-year window exceeds MAX_DATE_PREFIXES -> single prefix scan.
+        let q = LogQuery {
+            source: Some(LogSource::Workflow),
+            source_name: Some("WF-1".into()),
+            since: Some(ts("2020-01-01T00:00:00Z")),
+            until: Some(ts("2026-06-26T00:00:00Z")),
+            ..Default::default()
+        };
+        assert_eq!(scan_prefixes("p", &q), vec!["p/workflow/WF-1/"]);
+    }
+
+    #[test]
+    fn scan_prefixes_requires_source_name_for_date_scoping() {
+        // `since` set but no source_name -> cannot address the date segment.
+        let q = LogQuery {
+            source: Some(LogSource::Workflow),
+            since: Some(ts("2026-06-24T00:00:00Z")),
+            until: Some(ts("2026-06-25T00:00:00Z")),
+            ..Default::default()
+        };
+        assert_eq!(scan_prefixes("p", &q), vec!["p/workflow/"]);
     }
 
     #[test]
