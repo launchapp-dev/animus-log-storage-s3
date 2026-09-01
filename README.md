@@ -64,6 +64,26 @@ entries (most-recent first by key, then sorted oldest-first per the protocol).
 cannot be honored over object storage, so it still returns the snapshot rather
 than erroring. The daemon's historical `daemon logs` path uses `query`.
 
+### Run transcript read-back
+
+`query` is also the read path behind `animus output jsonl|read|monitor` for
+node-executed runs whose local `runs/<run_id>/` directory is absent (the
+kernel falls back to the installed `log_storage_backend` plugin). The writer
+contract those readers rely on:
+
+- `source` = `workflow`, `source_name` = the **workflow id** (prefix-narrows
+  the scan to `<prefix>/workflow/<workflow_id>/`).
+- `fields.run_id` = the phase run id the event belongs to; `fields.workflow_id`
+  mirrors `source_name`.
+- `fields.source_file` = the run-dir file the row came from
+  (`events.jsonl`, `json-output.jsonl`, …).
+- `fields.run_event` = the original JSONL row object, stored verbatim.
+
+Readers query by `source_name`, filter on `fields.run_id` in-process, and
+rebuild the JSONL rows from `fields.run_event`. Note the `query` contract
+keeps the **newest** `limit` entries: readers pass a high explicit limit, but
+a transcript larger than that limit loses its oldest events first.
+
 ## S3 client
 
 Uses the official **`aws-sdk-s3`** + **`aws-config`**. Chosen over `rust-s3`
