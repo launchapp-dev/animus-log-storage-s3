@@ -9,6 +9,28 @@ use aws_sdk_s3::Client;
 
 use crate::config::S3Config;
 
+/// Minimal object-store surface the backend logic needs: put/get one object
+/// body and list keys under a prefix. Abstracted from `S3Client` so the
+/// store/query/tail logic is testable without a live bucket.
+#[async_trait::async_trait]
+pub trait ObjectStore: Send + Sync {
+    /// Put a single object (idempotent — same key overwrites).
+    async fn put_object(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()>;
+    /// Get a single object body as bytes.
+    async fn get_object(&self, key: &str) -> anyhow::Result<Vec<u8>>;
+    /// List every key under `prefix` (bodies are fetched separately).
+    async fn list_keys(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
+    /// Cheap reachability probe for health reporting. The default lists keys
+    /// at the bucket root, which may be unbounded — implementations backed by
+    /// a real object store should override this with a bounded probe.
+    async fn ping(&self) -> Result<(), String> {
+        self.list_keys("")
+            .await
+            .map(|_| ())
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Built S3 client bound to a single bucket.
 #[derive(Clone)]
 pub struct S3Client {
@@ -128,6 +150,25 @@ impl S3Client {
             .await
             .map(|_| ())
             .map_err(display_sdk_err)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for S3Client {
+    async fn put_object(&self, key: &str, body: Vec<u8>) -> anyhow::Result<()> {
+        S3Client::put_object(self, key, body).await
+    }
+
+    async fn get_object(&self, key: &str) -> anyhow::Result<Vec<u8>> {
+        S3Client::get_object(self, key).await
+    }
+
+    async fn list_keys(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
+        S3Client::list_keys(self, prefix).await
+    }
+
+    async fn ping(&self) -> Result<(), String> {
+        S3Client::ping(self).await
     }
 }
 
